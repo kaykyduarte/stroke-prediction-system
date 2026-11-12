@@ -303,7 +303,7 @@ python -m pytest -q --basetemp=$testTemp
 
 During this review, **33 tests passed** with a fresh temporary directory. The existing default directory had a local permission issue. No model retraining or held-out test evaluation was performed.
 
-GitHub Actions runs on pushes to `main` and pull requests targeting `main`. It uses `ubuntu-latest`, `actions/checkout@v7`, and `actions/setup-python@v7`, installs `requirements-dev.txt`, and executes `pytest -q`. The workflow does not currently build/publish Docker images, deploy the API, or evaluate the real artifact.
+GitHub Actions runs on pushes to `main` and pull requests targeting `main`. It uses `ubuntu-latest`, `actions/checkout@v7`, and `actions/setup-python@v7`, installs `requirements-dev.txt`, and executes `python -m pytest -q` so that the repository root is included in Python's import path. The workflow does not currently build/publish Docker images, deploy the API, or evaluate the real artifact.
 
 ## Limitations
 
