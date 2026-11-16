@@ -50,3 +50,42 @@ jobs:
 
       - name: Construir imagem exclusiva de CI
         run: docker build -t stroke-prediction-api:ci .
+      
+      - name: Iniciar container
+        run: |
+          docker run -d \
+            --name stroke-ci-api \
+            -p 8000:8000 \
+            stroke-prediction-api:ci
+      
+      - name: Verificar health e readiness
+        run: |
+          curl --fail --silent --show-error \
+            --connect-timeout 2 \
+            --max-time 5 \
+            --retry 10 \
+            --retry-connrefused \
+            --retry-delay 1 \
+            http://127.0.0.1:8000/health
+
+          curl --fail --silent --show-error \
+            --connect-timeout 2 \
+            --max-time 5 \
+            --retry 10 \
+            --retry-connrefused \
+            --retry-delay 1 \
+            http://127.0.0.1:8000/ready
+
+      - name: Exibir logs em caso de falha
+        if: failure()
+        run: |
+          if docker container inspect stroke-ci-api > /dev/null 2>&1; then
+            docker logs stroke-ci-api
+          fi
+
+      - name: Encerrar container
+        if: always()
+        run: |
+          if docker container inspect stroke-ci-api > /dev/null 2>&1; then
+            docker rm -f stroke-ci-api
+          fi
