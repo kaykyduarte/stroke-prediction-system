@@ -60,27 +60,23 @@ jobs:
       
       - name: Verificar health e readiness
         run: |
-          curl --fail --silent --show-error \
-            --connect-timeout 2 \
-            --max-time 5 \
-            --retry 10 \
-            --retry-connrefused \
-            --retry-delay 1 \
-            http://127.0.0.1:8000/health
-
-          curl --fail --silent --show-error \
-            --connect-timeout 2 \
-            --max-time 5 \
-            --retry 10 \
-            --retry-connrefused \
-            --retry-delay 1 \
-            http://127.0.0.1:8000/ready
+          for endpoint in health ready; do
+            curl --fail --silent --show-error \
+              --connect-timeout 2 \
+              --max-time 5 \
+              --retry 20 \
+              --retry-all-errors \
+              --retry-delay 1 \
+              --retry-max-time 60 \
+              "http://127.0.0.1:8000/$endpoint"
+          done
 
       - name: Exibir logs em caso de falha
         if: failure()
         run: |
           if docker container inspect stroke-ci-api > /dev/null 2>&1; then
-            docker logs stroke-ci-api
+            docker inspect --format '{{json .State}}' stroke-ci-api
+            docker logs --timestamps stroke-ci-api
           fi
 
       - name: Encerrar container
