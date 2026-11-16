@@ -71,6 +71,62 @@ jobs:
               "http://127.0.0.1:8000/$endpoint"
           done
 
+      - name: Smoke test de predict
+        shell: bash
+        run: |
+          cat > request.json <<'JSON'
+          {
+            "gender": "Female",
+            "age": 65,
+            "hypertension": 1,
+            "heart_disease": 0,
+            "ever_married": "Yes",
+            "work_type": "Private",
+            "Residence_type": "Urban",
+            "avg_glucose_level": 180.5,
+            "bmi": null,
+            "smoking_status": "formerly smoked"
+          }
+          JSON
+
+          status=$(curl --silent --show-error \
+            --connect-timeout 5 \
+            --max-time 30 \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data-binary @request.json \
+            --output response.json \
+            --write-out "%{http_code}" \
+            http://127.0.0.1:8000/predict)
+
+          if [ "$status" != "200" ]; then
+            echo "Esperado HTTP 200, recebido: $status"
+            exit 1
+          fi
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          resposta = json.loads(
+              Path("response.json").read_text(encoding="utf-8")
+          )
+
+          assert isinstance(resposta, dict), "Resposta deve ser um objeto JSON"
+
+          score = resposta.get("score")
+          assert type(score) in (int, float), "Score deve ser numerico"
+          assert 0 <= score <= 1, "Score fora do intervalo [0, 1]"
+
+          classificacao = resposta.get("classificacao")
+          assert type(classificacao) is int, "Classificacao deve ser inteira"
+          assert classificacao in (0, 1), "Classificacao deve ser 0 ou 1"
+
+          assert resposta.get("versao_artefato") == "1.0", "Versao inesperada"
+
+          print("Smoke test de /predict aprovado.")
+          PY
+
       - name: Exibir logs em caso de falha
         if: failure()
         run: |
