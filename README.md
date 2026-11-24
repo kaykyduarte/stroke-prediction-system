@@ -1,6 +1,6 @@
 ﻿# Stroke Prediction API
 
-A machine learning project that trains, evaluates, persists, and serves a binary stroke classifier through FastAPI. It combines a scikit-learn preprocessing pipeline, validation-based threshold selection, typed HTTP contracts, automated tests, and a Docker image.
+A machine learning project that trains, evaluates, persists, and serves a binary stroke classifier through FastAPI. It combines a scikit-learn preprocessing pipeline, validation-based threshold selection, and typed HTTP contracts with HTTP metrics and latency logging, window-based alerts with hysteresis, supervised asynchronous tasks, bounded automatic monitor recovery, and Docker smoke tests in CI.
 
 **Intended use:** educational experimentation and software engineering practice. The model predicts the dataset's `stroke` label. It is not a diagnosis, a validated clinical decision tool, or a calibrated estimate of an individual's future stroke risk.
 
@@ -24,24 +24,54 @@ POST /predict
   -> apply the stored threshold
   -> StrokeOutput validation
   -> JSON response
+
+Monitoring and automatic recovery
+  -> HTTP responses update cumulative counters and a 300-second window
+  -> every 30 seconds, evaluate the window and apply alert hysteresis
+  -> record evaluation health and confirm stability after sustained successes
+  -> supervise unexpected monitor termination
+  -> authorize a bounded restart and await exponential backoff
+  -> start a new supervised monitor with a fresh stability period
+
+Shutdown
+  -> mark the application as stopping; reject new recovery scheduling
+  -> cancel and await pending recovery, then the current monitor
+  -> release the model reference
 ```
 
-Inference does not retrain a model, recalculate preprocessing statistics, or reload the artifact on each request.
+Inference does not retrain a model, recalculate preprocessing statistics, or reload the artifact on each request. HTTP alerts, evaluation health, and task termination are separate signals: an elevated HTTP error rate does not itself restart the monitor. Automatic recovery addresses a terminated monitor task, not the prediction model or failed client requests.
 
 ## Repository layout
 
 ```text
 stroke_prediction_system/
-├── .github/workflows/ci.yml       # GitHub Actions test workflow
+├── .github/workflows/ci.yml       # Tests, Docker build, and HTTP smoke tests
 ├── artifacts/
 │   └── stroke_model.joblib        # Generated locally; excluded from Git
 ├── data/raw/
 │   └── healthcare-dataset-stroke-data.csv  # Supplied locally; excluded from Git
 ├── notebooks/01_eda.ipynb         # Exploratory analysis
+├── scripts/
+│   └── generate_ci_artifact.py   # Synthetic artifact for container tests
 ├── src/stroke_prediction/
 │   ├── api/
-│   │   ├── main.py               # Lifespan, routes, error handling
-│   │   └── schemas.py            # Input and output contracts
+│   │   ├── main.py               # Lifespan, routes, task factories and callbacks
+│   │   ├── schemas.py            # Input and output contracts
+│   │   ├── security.py           # Internal-endpoint API-key validation
+│   │   ├── metrics.py            # Cumulative HTTP response counters
+│   │   ├── window_metrics.py     # Per-second buckets in a rolling window
+│   │   ├── metrics_summary.py    # Error percentages and summary helpers
+│   │   ├── alert_evaluation.py   # Minimum-volume gate and alert evaluation
+│   │   ├── alert_state.py        # Incident transitions and hysteresis
+│   │   ├── alert_monitor.py      # Periodic evaluation loop
+│   │   ├── monitor_health.py     # Degradation, inactivity, and stability
+│   │   ├── alert_supervision.py  # Monitor termination logging
+│   │   ├── retry_policy.py      # Exponential backoff calculation
+│   │   ├── retry_state.py       # Thread-safe restart budget
+│   │   ├── restart_planning.py  # Restart authorization and delay planning
+│   │   ├── restart_executor.py  # Cancellable backoff and task creation
+│   │   ├── restart_recovery.py  # Recovery orchestration
+│   │   └── recovery_policy.py   # Reset restart budget after stability
 │   ├── data/preprocessing.py     # Splitting, imputation, encoding, scaling
 │   └── models/
 │       ├── train.py              # Experiments and artifact export
@@ -94,13 +124,37 @@ The runtime requirements currently pin:
 | threadpoolctl | 3.7.0 |
 | Starlette | 1.10.0 |
 
-Development dependencies additionally include pytest, httpx2, Matplotlib, ipykernel, and Jupyter. Preserve compatible Python and library versions when loading serialized models. The artifact does not currently record its dependency versions or dataset checksum.
+Development dependencies additionally pin pytest 9.1.1, **httpx2 2.16.0**, Matplotlib 3.11.2, ipykernel 7.4.0, and Jupyter 1.1.1. `httpx2` is intentional: the installed Starlette 1.10.0 test client imports it; it is not a typo for `httpx`. Preserve compatible Python and library versions when loading serialized models. The artifact does not currently record its dependency versions or dataset checksum.
+
+### Internal monitor API key
+
+`MONITOR_API_KEY` configures the expected key for `GET /internal/monitor-health`. Clients supply it through the `X-Monitor-Key` header. Missing configuration denies access; it does not disable authentication or prevent the public API from starting.
+
+For a local demonstration only, set a fictitious value before starting Uvicorn:
+
+```powershell
+$env:MONITOR_API_KEY = "chave-local-teste"
+```
+
+```bash
+export MONITOR_API_KEY='chave-local-teste'
+```
+
+This published example is not a production secret. Use an independently generated secret through your deployment's secret-management mechanism, never commit real keys, and use HTTPS for network access. The current application reads the process environment; it does not automatically load a `.env` file. The key is not required for `/health`, `/ready`, or `/predict`.
 
 ## Dataset and preprocessing
 
 Place the CSV at `data/raw/healthcare-dataset-stroke-data.csv`. The inspected file contains **5,110 records**: 4,861 with `stroke=0` and 249 with `stroke=1` (approximately 4.87% positives). It contains 201 missing BMI values and 1,544 records with `smoking_status="Unknown"`.
 
-The CSV is excluded from Git. Dataset acquisition, provenance, and usage terms are not documented in the current repository; obtain the matching dataset and verify its terms before use or redistribution.
+The dataset source supplied for this project is [Stroke Prediction Dataset on Kaggle](https://www.kaggle.com/datasets/fedesoriano/stroke-prediction-dataset), published under the account `fedesoriano`.
+
+To prepare the training data:
+
+1. Download the dataset from the linked Kaggle page.
+2. Extract `healthcare-dataset-stroke-data.csv` from the download.
+3. Place it in `data/raw/` without changing the filename or record ordering.
+
+The CSV is excluded from Git. The Kaggle source is now identified, but this repository does not independently establish the original collection provenance or clinical representativeness of the records. Verify the source page's current license and usage terms before use or redistribution.
 
 `id` and `stroke` are excluded from input features. The shared `ColumnTransformer` applies:
 
@@ -199,8 +253,47 @@ During startup, `lifespan` loads `artifacts/stroke_model.joblib` relative to the
 | `GET /health` | HTTP 200 with `{"status":"ok"}`, independent of the model once the app has started |
 | `GET /ready` | HTTP 200 with `{"status":"ready"}` if an artifact is present; otherwise HTTP 503 with `{"status":"not_ready"}` |
 | `POST /predict` | Validate one record and return score, classification, and artifact version |
+| `GET /internal/monitor-health` | Return monitor state after `X-Monitor-Key` authentication; excluded from public OpenAPI |
 
 Readiness checks artifact presence; it does not perform an inference self-test.
+
+### Protected monitor health
+
+Send the configured key in the request header:
+
+```bash
+curl -H "X-Monitor-Key: chave-local-teste" http://127.0.0.1:8000/internal/monitor-health
+```
+
+| Condition | HTTP status | Response |
+| --- | ---: | --- |
+| `MONITOR_API_KEY` is not configured or is empty | 503 | `{"detail":"Acesso ao monitor indisponível."}` |
+| Header is missing or incorrect | 403 | `{"detail":"Acesso negado."}` |
+| Correct key | 200 | Current monitor state |
+
+An illustrative healthy response is:
+
+```json
+{
+  "falhas_consecutivas": 0,
+  "sucessos_consecutivos": 2,
+  "degradado": false,
+  "inativo": false,
+  "tarefa_ativa": true
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `falhas_consecutivas` | Consecutive metric-evaluation failures |
+| `sucessos_consecutivos` | Consecutive successful evaluations in the current sequence |
+| `degradado` | Evaluation health is degraded; recovery has not yet been confirmed |
+| `inativo` | More than 90 seconds have elapsed since the last recorded evaluation or execution-start reference |
+| `tarefa_ativa` | The current monitor task has not completed, failed, or been cancelled |
+
+The values are dynamic. HTTP 200 means the authorized state query succeeded, even if the monitor is degraded, inactive, or terminated. These flags do not change `/ready`: a loaded model can remain available while monitoring is impaired. A recently terminated task can report `tarefa_ativa=false` and `inativo=false` simultaneously.
+
+The route uses `include_in_schema=False`, so it is absent from `/docs` and the public OpenAPI schema. This is not a security boundary; the dependency validates the header using `secrets.compare_digest`. API keys and request bodies are not intentionally included in the monitoring logs.
 
 ### Input contract
 
@@ -267,21 +360,96 @@ This response illustrates the format only; it is not a claimed prediction for th
 
 The response-validation handler logs a generic message without request contents or exception values. Standard request-validation responses may echo invalid input; clients and infrastructure should avoid unnecessary sensitive-payload logging. The custom handler does not cover every possible inference/runtime exception.
 
+## Observability and monitoring
+
+The HTTP middleware logs method, registered route template, response status, and duration in milliseconds using `perf_counter()`. Unmatched paths are labeled `unmatched`; arbitrary URL values, query strings, and request bodies are not included in this log. Application logging must be configured to emit `INFO` messages to make these latency records visible. Duration covers processing until the response returns to the middleware, not complete transmission to the client.
+
+Each response returned through the middleware updates two independent in-memory collectors:
+
+- `MetricasAPI`: cumulative total and separate 2xx, 4xx, and 5xx counts since startup. Other status classes count toward the total only.
+- `MetricasJanela`: total and 5xx counts over the last 300 seconds, using chronological `deque` buckets with one-second resolution and a monotonic clock. Both registration and queries expire old buckets, including after idle periods.
+
+Collectors use locks and return copies of their counters. The middleware counts public endpoints, internal endpoints, and unmatched-route responses alike. Probe traffic and authentication-related responses therefore also affect the measured traffic and error rate. Unhandled exceptions that escape `call_next()` before a response is returned are not recorded by the current middleware.
+
+Summary helpers calculate `5xx / total * 100`; no traffic produces `None`, not a zero-error estimate. They are reusable components, not a public `/metrics` endpoint. There is no Prometheus integration.
+
+### HTTP incident policy
+
+| Setting | Implemented value |
+| --- | --- |
+| Rolling window | 300 seconds |
+| Evaluation interval | 30 seconds; first evaluation occurs after the initial wait |
+| Minimum volume for an alert-state decision | 20 responses in the window |
+| Incident activation | 5xx rate **at least 10%** |
+| Incident recovery | 5xx rate **at most 5%** |
+
+Hysteresis preserves the existing incident state between 5% and 10%. Insufficient volume also preserves it: even a 0% error rate from fewer than 20 responses does not prove recovery. A warning is logged only when a new incident starts, avoiding repeated notifications for the same active incident. No external notification is sent.
+
+These are educational thresholds, not production availability objectives. An insufficient sample does not establish health, and this statistical rule does not replace handling of individual critical failures.
+
+### Health of the monitoring loop
+
+This is a separate state machine from HTTP incident hysteresis:
+
+| Signal | Policy |
+| --- | --- |
+| Degradation | Three or more consecutive evaluation failures |
+| Recovery from degradation | Two consecutive successful evaluations |
+| Inactivity | More than 90 seconds since the last evaluation/reference |
+| Task termination | Observed independently through `asyncio.Task.done()` |
+
+Both success and failure refresh the evaluation timestamp: an evaluation can fail while the monitor remains active. One success resets the consecutive-failure counter but does not immediately clear a previously degraded state. Any failure resets the consecutive-success sequence.
+
+## Automatic recovery
+
+The task factory creates the monitor, updates the shared task reference, and attaches a termination callback. Unexpected exceptions are logged with their original traceback; a normal return is also unexpected for this continuous loop. Expected cancellation does not trigger recovery.
+
+When a non-cancelled monitor ends, recovery scheduling first checks that shutdown has not begun and that another recovery is not already pending. The planner atomically reserves a restart attempt through `ControleReinicializacoes`, and the executor awaits the backoff before preparing a new execution and calling the same supervised task factory.
+
+| Setting | Implemented value |
+| --- | --- |
+| Maximum authorized restarts before a stability reset | 3 |
+| Attempt 1 delay | 1 second |
+| Attempt 2 delay | 2 seconds |
+| Attempt 3 delay | 4 seconds |
+| Generic backoff cap | 30 seconds; not reached with this three-attempt budget |
+| Stable success period before resetting the budget | At least 120 seconds |
+| Minimum consecutive successes | At least 2 |
+| Maximum age of the latest evaluation for stability | 90 seconds |
+
+The same restart-control instance is passed to successive monitors. Creating a new task does not reset its budget. Each new execution clears the success-period start and success count and refreshes the inactivity reference, while preserving degradation. Stability is confirmed only after sufficient successes over the required period, with a recent evaluation. A failure or a gap of more than 90 seconds between evaluations restarts the success period. With regular 30-second evaluations, five successes spanning 120 seconds satisfy the time criterion.
+
+Evaluation failures are logged and counted without terminating the loop. A failure in the separate recovery-confirmation policy is logged independently and does **not** turn a successful metric evaluation into a failure. Cancellation remains propagatable. If the recovery task itself fails, its dedicated callback records that exception; it does not recursively recover the recovery task.
+
+If all three restart attempts are exhausted and the last monitor ends, there is no automatic fifth monitor execution. With no monitor left to produce successful evaluations, the stability policy cannot reset the budget. Operator intervention or a new process startup may be necessary. `/health` can still return 200, `/ready` can remain 200 while the artifact is loaded, and the protected endpoint reports `tarefa_ativa=false`.
+
+Shutdown sets `app.state.encerrando=True` before cancelling and awaiting recovery. It then obtains, cancels, and awaits the current monitor and releases the artifact reference. New recoveries are blocked during shutdown. Supervision callbacks own exception logging; shutdown handles already observed task exceptions without duplicating those logs.
+
+The pending-recovery guard prevents concurrent recovery tasks in the same event loop; it is not a durable record that deduplicates every repeated termination notification. All counters, incident states, health references, and restart budgets are per-process and are lost on restart. Run a **single worker** for the current design: additional workers each create their own monitor and can generate duplicate alerts.
+
 ## Docker
 
 The artifact must exist locally before building. It is excluded from Git but intentionally included in the Docker build context. The original CSV is not needed inside the image.
 
 ```bash
-docker build -t stroke-prediction-api:1.1 .
-docker run --rm -p 127.0.0.1:8000:8000 stroke-prediction-api:1.1
+docker build -t stroke-prediction-system:local .
+docker run --rm --name stroke-api -p 127.0.0.1:8000:8000 -e MONITOR_API_KEY=chave-local-teste stroke-prediction-system:local
 ```
 
-Open [http://localhost:8000/docs](http://localhost:8000/docs) and check `/health` and `/ready`. This example publishes the port only on the local host.
+Open [http://localhost:8000/docs](http://localhost:8000/docs). From another terminal, check the three operational endpoints:
+
+```bash
+curl --fail http://127.0.0.1:8000/health
+curl --fail http://127.0.0.1:8000/ready
+curl --fail -H "X-Monitor-Key: chave-local-teste" http://127.0.0.1:8000/internal/monitor-health
+```
+
+On Windows PowerShell, use `curl.exe`. This example publishes the port only on the local host and uses a deliberately fictitious demonstration key. Do not reuse that key outside local testing or bake a real secret into an image. An actual deployment should inject its own key, for example by forwarding an already configured environment variable with `-e MONITOR_API_KEY`, and provide HTTPS for network access.
 
 The image installs runtime requirements, copies source and artifact, and starts Uvicorn on container port 8000 as the non-root `app` user. That user can read the source and model. The image does not train or evaluate models. Verify its user with:
 
 ```bash
-docker run --rm stroke-prediction-api:1.1 id
+docker run --rm stroke-prediction-system:local id
 ```
 
 The base image, `python:3.13-slim`, is not pinned to a patch version or immutable digest. Builds may change when the base image changes. A missing artifact causes the Dockerfile's explicit `COPY` step to fail.
@@ -292,7 +460,7 @@ The base image, `python:3.13-slim`, is not pinned to a patch version or immutabl
 python -m pytest -q
 ```
 
-Tests cover splitting, preprocessing, metrics, threshold selection, final-evaluation calculations, persistence equivalence, inference ordering, input/output schemas, lifespan behavior, health/readiness, and prediction responses. They use synthetic data and mocked loading/inference and do not require the CSV or real artifact.
+Tests cover splitting, preprocessing, model evaluation and threshold selection, persistence equivalence, inference ordering, and input/output schemas. Operational coverage includes API-key security, HTTP metrics, rolling-window expiration, alert hysteresis, concurrent restart-budget access, task supervision, exponential backoff, real cancellation during backoff, stability and inactivity, recovery failures, restart exhaustion, and coordinated shutdown. Tests use synthetic data and mocked loading/inference and do not require the original CSV or real model artifact.
 
 `pyproject.toml` configures `--basetemp=./.pytest_tmp`. Pytest clears this directory between runs; keep it exclusively for test files. If Windows permissions prevent access, specify a fresh directory under a writable temporary location:
 
@@ -301,9 +469,36 @@ $testTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("stroke-tests-" + [guid
 python -m pytest -q --basetemp=$testTemp
 ```
 
-During this review, **33 tests passed** with a fresh temporary directory. The existing default directory had a local permission issue. No model retraining or held-out test evaluation was performed.
+Latest locally reported verification: **160 tests passed in 4.23 seconds**. The GitHub Actions workflow also
+completed successfully. No real-model retraining or held-out test evaluation was performed during this documentation update.
 
-GitHub Actions runs on pushes to `main` and pull requests targeting `main`. It uses `ubuntu-latest`, `actions/checkout@v7`, and `actions/setup-python@v7`, installs `requirements-dev.txt`, and executes `python -m pytest -q` so that the repository root is included in Python's import path. The workflow does not currently build/publish Docker images, deploy the API, or evaluate the real artifact.
+### GitHub Actions pipeline
+
+The workflow runs on pushes to `main` and pull requests targeting `main`. Both jobs use `ubuntu-latest`, `actions/checkout@v7`, and `actions/setup-python@v7` with Python 3.13.
+
+```text
+Push / pull request to main
+  -> tests: install requirements-dev.txt -> python -m pytest -q
+  -> docker-build (requires tests to pass):
+       install requirements.txt
+       -> generate a synthetic artifact
+       -> build stroke-prediction-api:ci
+       -> start the container
+       -> GET /health and /ready with bounded retries
+       -> POST /predict and validate status and JSON contract
+       -> show container state/logs on failure
+       -> remove the container with if: always()
+```
+
+The prediction smoke test requires HTTP 200, a numeric score in `[0, 1]`, an integer classification of 0 or 1, and artifact version `"1.0"`. It does not assert a particular score or predictive quality. The current Docker job does not configure or smoke-test the protected monitor endpoint.
+
+The synthetic generator reuses the project's preprocessing and persistence, trains only on fictitious data, includes missing BMI, requires an explicit output path, and refuses existing destinations. For a local experiment, keep it separate from the real artifact:
+
+```bash
+python -m scripts.generate_ci_artifact --output artifacts/stroke_model_ci.joblib
+```
+
+The clean CI workspace instead generates `artifacts/stroke_model.joblib`, the path required by the Dockerfile. Never replace a real deployment artifact with the synthetic CI model. Containers are started without `--rm` so failure logs remain available until explicit cleanup. The workflow builds and tests locally on the runner; it **does not publish images to Docker Hub or another registry, deploy to a cloud service, or evaluate the real model**.
 
 ## Limitations
 
@@ -314,9 +509,16 @@ GitHub Actions runs on pushes to `main` and pull requests targeting `main`. It u
 - **Schema scope:** basic numeric limits and category names are checked, but cross-field consistency, measurement units, comprehensive plausibility limits, and distribution drift are not validated. Default Pydantic coercion remains enabled; numeric typing is not strict.
 - **Missingness:** only BMI is imputed. Other missing fields are rejected at the API boundary; missingness patterns are not explicitly modeled.
 - **Artifact management:** no signatures, checksum verification, dependency manifest, unique training-run identifiers, or model registry are implemented. Required-key checks do not make untrusted joblib files safe.
-- **Deployment:** the HTTP API accepts one record per request and has no authentication, authorization, rate limiting, TLS termination, automatic model reload, or drift monitoring. Additional controls are needed before exposing it outside a controlled environment.
+- **Access control:** `/predict`, `/health`, and `/ready` have no application-level authentication. `/internal/monitor-health` requires a shared API key, but there are no per-user roles, key rotation/auditing facilities, or rate limits. Hiding a route from OpenAPI does not make it private. Use appropriate network controls and HTTPS before exposing the service.
+- **Observability scope:** HTTP availability and 5xx monitoring do not measure predictive accuracy, calibration, fairness, or clinical outcomes. There is no data-drift or model-drift detection, persistent external alert delivery, or durable incident store. Logging an alert does not guarantee that an operator receives it.
+- **Process-local recovery:** metrics, alert state, monitor health, and restart budgets live only in memory within each process. Locks protect threads, not separate workers or containers. The current single-worker design can stop monitoring after restart exhaustion; no external watchdog or automatic process restart is implemented here.
+- **Deployment:** the API accepts one record per HTTP request. TLS termination, automatic model reload, and a production deployment platform are not included. Container smoke tests use a synthetic model and do not establish production behavior or validate real-model compatibility across platforms.
 - **Privacy:** the generic response-error log is only one safeguard. Handling health-related inputs requires appropriate access controls and logging policies across clients, application, and infrastructure.
 
 ## License and data attribution
 
-No software license file or dataset source/license declaration is currently included. Add an appropriate project license and verified dataset attribution before distributing the project or its data artifacts.
+Dataset attribution: **fedesoriano, Stroke Prediction Dataset, Kaggle**. Source: [kaggle.com/datasets/fedesoriano/stroke-prediction-dataset](https://www.kaggle.com/datasets/fedesoriano/stroke-prediction-dataset).
+
+The dataset license has not been independently verified against readable primary-source metadata during this documentation update. Consult the Kaggle listing for the applicable license and terms; source attribution alone does not grant redistribution rights.
+
+No software license file is currently included in this repository. A dataset's license does not automatically license this project's source code. Add an appropriate project license before distributing the software under specific license terms.
